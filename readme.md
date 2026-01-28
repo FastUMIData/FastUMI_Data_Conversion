@@ -41,8 +41,12 @@ Install the required Python libraries:
 ```bash
 pip install pandas numpy h5py opencv-python tqdm
 
+raw_lerobot_v2.1：
 Recommended `lerobot` dependency (git + pinned revision):
 lerobot = { git = "https://github.com/huggingface/lerobot", rev = "0cf864870cf29f4738d3ade893e6fd13fbd7cdb5" }
+
+raw_lerobot_v4.0：
+pip install lerobot==0.4.0 -i https://pypi.tuna.tsinghua.edu.cn/simple    
 ```
 Note: Ensure FFmpeg is installed on your system, as the script uses ffprobe to verify video health.
 
