@@ -1,8 +1,7 @@
 """
 Convert raw recorded sessions directly into a LeRobot dataset.
 
-This script aligns timestamps, extracts frames from recorded videos,
-and writes episodes into a LeRobot dataset (no intermediate HDF5).
+This script aligns timestamps, extracts frames from recorded videos, and writes episodes into a LeRobot dataset.
 
 Key assumptions:
 - Video frames are read with OpenCV (BGR), converted to RGB and resized
@@ -21,18 +20,7 @@ Minimal usage example (required flags shown):
         --source_camera_fps 20 \
         --mode video \
         --output /path/to/save/lerobot
-
-Notes:
-- The script expects session directories named like `session*` under
-Notes:
-- The script expects session directories named like `session*` under
-  `--task-root` and standard subfolders (`RGB_Images`, `Clamp_Data`,
-  `Merged_Trajectory`, etc.). See the code for exact expectations.
-- Required Python packages: `opencv-python`, `numpy`, `pandas`, `h5py`,
-  and the `lerobot` package providing `LeRobotDataset`.
-
-Recommended `lerobot` dependency (git + pinned revision):
-pip install lerobot==0.4.0 -i https://pypi.tuna.tsinghua.edu.cn/simple                          
+                       
 """
 from __future__ import annotations
 import argparse
