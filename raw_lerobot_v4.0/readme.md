@@ -1,9 +1,6 @@
 
 ## 💻 Usage
 
-
-```
-"""
 Convert raw recorded sessions directly into a LeRobot dataset.
 
 This script aligns timestamps, extracts frames from recorded videos,
@@ -16,7 +13,7 @@ Key assumptions:
     Dual-arm sessions populate both `robot_0` and `robot_1` image fields.
 
 Minimal usage example (required flags shown):
-
+'''code
     python raw_2_lerobot_V4.0.py \
         --task-root /path/to/raw/task_root \
         --repo-id myorg/myrepo \
@@ -26,7 +23,7 @@ Minimal usage example (required flags shown):
         --source_camera_fps 20 \
         --mode video \
         --output /path/to/save/lerobot
-
+'''
 Notes:
 - The script expects session directories named like `session*` under
 Notes:
@@ -37,7 +34,6 @@ Notes:
   and the `lerobot` package providing `LeRobotDataset`.
 
 Recommended `lerobot` dependency (git + pinned revision):
-
+'''code
 pip install lerobot==0.4.0 -i https://pypi.tuna.tsinghua.edu.cn/simple     
-"""
-```
+'''
