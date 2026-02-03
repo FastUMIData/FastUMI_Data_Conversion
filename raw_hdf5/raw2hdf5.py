@@ -123,8 +123,10 @@ def load_arm_data(data_path):
 
     if 'aligned_stamp' in timestamps.columns:
         timestamps['timestamp'] = timestamps['aligned_stamp']
+    elif 'header_stamp' in timestamps.columns:
+        timestamps['timestamp'] = timestamps['header_stamp']
     elif 'timestamp' not in timestamps.columns:
-        timestamps['timestamp'] = np.arange(len(timestamps), dtype=float)
+        timestamps['timestamp'] = np.arange(len(timestamps), dtype=float))
     
     if 'frame_index' not in timestamps.columns:
         timestamps['frame_index'] = np.arange(len(timestamps), dtype=int)
@@ -304,5 +306,6 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
     cam_names = [s.strip() for s in args.camera_names.split(",") if s.strip()]
+
 
     convert_task(args.task_root, args.output, cam_names, args.frequency, args.num_workers)
