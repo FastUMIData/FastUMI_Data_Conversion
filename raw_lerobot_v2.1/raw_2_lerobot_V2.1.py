@@ -20,10 +20,9 @@ Minimal usage example (required flags shown):
         --target-fps 20 \
         --source_camera_fps 20 \
         --mode video \
-        --output /path/to/save/lerobot
+        --output /path/to/save/lerobot \
+        --max_workers 8
 
-Notes:
-- The script expects session directories named like `session*` under
 Notes:
 - The script expects session directories named like `session*` under
   `--task-root` and standard subfolders (`RGB_Images`, `Clamp_Data`,
@@ -40,7 +39,10 @@ import argparse
 import os
 import sys
 from pathlib import Path
-from typing import List, Optional, Literal
+from typing import List, Optional, Literal, Tuple, Dict, Any
+
+import concurrent.futures
+from multiprocessing import cpu_count
 
 import dataclasses
 import shutil
@@ -71,11 +73,77 @@ def _to_rgb_and_resize(img, size=(224, 224)):
 
 
 # ---------------------------------------------------------------------------
-# Module-level helpers (moved out of convert_raw_to_lerobot)
+# Module-level helpers (modified and added)
 # ---------------------------------------------------------------------------
 
-# Assume source camera recorded at 60 FPS unless specified otherwise.
-# SOURCE_CAMERA_FPS = 60
+def sort_timestamps_with_original_indices(ts_arr: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """
+    added function: Sort timestamps while retaining original indices.
+    Args:
+        ts_arr: 1D numpy array of timestamps (may contain nan/inf).
+    Returns:
+        sorted_ts: Sorted numpy array of timestamps (finite values only).
+        original_indices: Indices mapping sorted_ts back to original ts_arr.
+    """
+    ts_arr = np.asarray(ts_arr, dtype=np.float64)
+    
+    # Filter out nan/inf values (retain original indices, mark invalid timestamps as -1)
+    valid_ts_mask = np.isfinite(ts_arr)
+    valid_ts = ts_arr[valid_ts_mask]
+    valid_original_indices = np.where(valid_ts_mask)[0]
+    
+    if len(valid_ts) == 0:
+        raise ValueError("timestamp array contains no valid finite values to sort")
+    
+    # Sort and retain original indices
+    sorted_indices = np.argsort(valid_ts)
+    sorted_ts = valid_ts[sorted_indices]
+    sorted_original_indices = valid_original_indices[sorted_indices]
+    
+    return sorted_ts, sorted_original_indices
+
+
+def find_nearest_indices(sorted_arr: np.ndarray, targets: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Modified points:
+    1.  Explicitly check if input sorted_arr is truly sorted
+    2.  Return not only the nearest indices but also the corresponding timestamp differences (for subsequent tolerance filtering)
+    3.  Add checks for empty and invalid values to avoid silent failures
+    """
+    # Explicit check: sorted_arr must be non-empty and monotonically increasing
+    if len(sorted_arr) == 0:
+        raise ValueError("input sorted_arr cannot be an empty array for nearest neighbor search")
+    
+    if not np.all(np.diff(sorted_arr) >= 0):
+        raise ValueError("input sorted_arr is not a monotonically increasing sorted array, binary search (np.searchsorted) will fail")
+    
+    # Filter out nan/inf values in targets (to avoid search errors)
+    targets = np.asarray(targets, dtype=np.float64)
+    valid_target_mask = np.isfinite(targets)
+    if not np.any(valid_target_mask):
+        raise ValueError("input targets contains no valid finite values for nearest neighbor search")
+    
+    # Original binary search logic retained
+    indices = np.searchsorted(sorted_arr, targets)
+    indices = np.clip(indices, 1, len(sorted_arr) - 1)
+    
+    # Calculate differences to the left and right neighbors, choose the closer one
+    left = sorted_arr[indices - 1]
+    right = sorted_arr[indices]
+    left_diff = np.abs(targets - left)
+    right_diff = np.abs(targets - right)
+    
+    # Determine final indices and calculate minimum differences (for tolerance filtering)
+    choose_left = left_diff < right_diff
+    final_indices = np.where(choose_left, indices - 1, indices)
+    final_diffs = np.where(choose_left, left_diff, right_diff)
+    
+    # For invalid targets (nan/inf), fill with -1 (mark as invalid index) and differences with infinity
+    final_indices[~valid_target_mask] = -1
+    final_diffs[~valid_target_mask] = np.inf
+    
+    return final_indices, final_diffs
+
 
 def extract_frames_sequential(video_path: str, frame_indices):
     """Read selected frames from a video in sequential order.
@@ -99,7 +167,11 @@ def extract_frames_sequential(video_path: str, frame_indices):
     current_frame = 0
     for target in sorted_indices:
         while current_frame < target:
-            cap.grab()
+            # added check for grab() failure
+            if not cap.grab():
+                print(f"[Warning] Video {video_path} failed to grab frame {current_frame}, possible video corruption")
+                current_frame += 1
+                continue
             current_frame += 1
         ret, frame = cap.read()
         current_frame += 1
@@ -110,19 +182,6 @@ def extract_frames_sequential(video_path: str, frame_indices):
     return frames
 
 
-def find_nearest_indices(sorted_arr: np.ndarray, targets: np.ndarray) -> np.ndarray:
-    """Find nearest indices in a sorted array for each target using binary search.
-
-    This is a vectorized replacement for repeated argmin(abs(arr - t)).
-    """
-    indices = np.searchsorted(sorted_arr, targets)
-    indices = np.clip(indices, 1, len(sorted_arr) - 1)
-    left = sorted_arr[indices - 1]
-    right = sorted_arr[indices]
-    indices = indices - (np.abs(targets - left) < np.abs(targets - right)).astype(int)
-    return indices
-
-
 def clamp_txt_to_csv(txt_path: str, csv_path: str) -> bool:
     """Convert clamp_data text file to CSV if present."""
     try:
@@ -130,7 +189,8 @@ def clamp_txt_to_csv(txt_path: str, csv_path: str) -> bool:
         df.columns = ["timestamp", "clamp"]
         df.to_csv(csv_path, index=False)
         return True
-    except Exception:
+    except Exception as e:
+        print(f"[Warning] Failed to convert clamp TXT file {txt_path} to CSV: {str(e)}")
         return False
 
 
@@ -174,7 +234,8 @@ def get_video_state(video_path: str) -> bool:
         cmd = ['ffprobe', '-v', 'error', '-show_entries', 'format=duration', '-of', 'default=noprint_wrappers=1:nokey=1', video_path]
         result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         return result.returncode == 0 and float(result.stdout.strip()) > 0
-    except Exception:
+    except Exception as e:
+        print(f"[Warning] Failed to validate video {video_path}: {str(e)}. Please check if FFmpeg is installed.")
         return False
 
 
@@ -187,9 +248,12 @@ def read_trj_txt(txt_path: str) -> pd.DataFrame:
         raise FileNotFoundError(f"trajectory txt not found: {txt_path}")
     df = pd.read_csv(txt_path, sep=r"\s+", header=None)
     if df.shape[1] < 8:
-        raise ValueError("trajectory txt expects >=8 columns")
+        raise ValueError(f"Trajectory TXT file {txt_path} has fewer than 8 columns, current columns: {df.shape[1]}")
     df = df.iloc[:, :8]
     df.columns = ['timestamp', 'Pos X', 'Pos Y', 'Pos Z', 'Q_X', 'Q_Y', 'Q_Z', 'Q_W']
+    # Added: Validate that the timestamp column contains valid numeric values
+    if not pd.api.types.is_numeric_dtype(df['timestamp']):
+        raise ValueError(f"Trajectory TXT file {txt_path} timestamp column is not numeric and cannot be processed")
     return df
 
 
@@ -203,6 +267,9 @@ def load_trajectory(session_path: str, traj_source: str) -> pd.DataFrame:
             df = pd.read_csv(trj_csv)
             expected_cols = ['timestamp', 'Pos X', 'Pos Y', 'Pos Z', 'Q_X', 'Q_Y', 'Q_Z', 'Q_W']
             if all(c in df.columns for c in expected_cols):
+                # Added: Validate that the timestamp column contains valid numeric values
+                if not pd.api.types.is_numeric_dtype(df['timestamp']):
+                    raise ValueError(f"Merged trajectory CSV file {trj_csv} timestamp column is not numeric")
                 return df[expected_cols]
         if os.path.exists(trj_txt):
             return read_trj_txt(trj_txt)
@@ -229,26 +296,33 @@ def load_arm_data(data_path: str, traj_source: str):
     clamp_path = os.path.join(clamp_dir, "clamp.csv")
     ensure_clamp_csv_for_path(data_path)
     if not (os.path.exists(video_path) and os.path.exists(timestamps_path) and os.path.exists(clamp_path)):
+        print(f"[Warning] Arm data path {data_path} is missing required files (video.mp4 / timestamps.csv / clamp.csv)")
         return None
     if not get_video_state(video_path):
+        print(f"[Warning] Video file {video_path} is invalid (corrupted or zero duration)")
         return None
     try:
         traj = load_trajectory(data_path, traj_source)
         clamp = pd.read_csv(clamp_path)
         timestamps = pd.read_csv(timestamps_path)
-    except Exception:
+    except Exception as e:
+        print(f"[Warning] Failed to load arm data {data_path}: {str(e)}")
         return None
     
-    # if 'aligned_stamp' in timestamps.columns:
-    #     timestamps['timestamp'] = timestamps['aligned_stamp']
-    # elif 'timestamp' not in timestamps.columns:
-    #     timestamps['timestamp'] = np.arange(len(timestamps), dtype=float)
-    
-    if  'header_stamp' in timestamps.columns:
-        timestamps['timestamp'] = timestamps['header_stamp']
-    elif 'aligned_stamp' in timestamps.columns:
+    # Validate and assign timestamp column
+    if 'aligned_stamp' in timestamps.columns:
         timestamps['timestamp'] = timestamps['aligned_stamp']
-        
+    elif 'header_stamp' in timestamps.columns:
+        timestamps['timestamp'] = timestamps['header_stamp']
+    else:
+        print(f"[Warning] Timestamp file {timestamps_path} does not have a suitable timestamp column (aligned_stamp / header_stamp)")
+        return None
+    
+    # Validate timestamp column
+    if not pd.api.types.is_numeric_dtype(timestamps['timestamp']):
+        print(f"[Warning] Timestamp file {timestamps_path} timestamp column is not numeric")
+        return None
+    
     if 'frame_index' not in timestamps.columns:
         timestamps['frame_index'] = np.arange(len(timestamps), dtype=int)
     return {"traj": traj, "clamp": clamp, "timestamps": timestamps, "video_path": video_path}
@@ -261,10 +335,12 @@ def find_all_sessions(root_path: str) -> List[str]:
         for d in dirs:
             if d.startswith("session"):
                 found_sessions.append(os.path.join(root, d))
+    if not found_sessions:
+        print(f"[Warning] No session directories found under root path {root_path}")
     return sorted(found_sessions)
 
 
-def prepare_bimanual_alignment(left: dict, right: dict, target_fps: int, source_camera_fps: int):
+def prepare_bimanual_alignment(left: dict, right: dict, target_fps: int, source_camera_fps: int, tolerance_s: float = 1e-4):
     """Prepare timestamp/trajectory indices and pre-extract frames for dual-arm sessions.
 
     Args:
@@ -272,6 +348,7 @@ def prepare_bimanual_alignment(left: dict, right: dict, target_fps: int, source_
         right: dict returned by `load_arm_data` for right arm.
         source_camera_fps: original camera frequency in Hz.
         target_fps: desired output frequency in Hz.
+        tolerance_s: time alignment tolerance in seconds; values exceeding this are marked as invalid
 
     Returns:
         Tuple containing:
@@ -287,34 +364,110 @@ def prepare_bimanual_alignment(left: dict, right: dict, target_fps: int, source_
     master_ts = master["timestamp"].to_numpy()
     master_fidx = master["frame_index"].to_numpy().astype(int)
 
-    # Left arrays
+    # ---------------------- Left arm data processing (sorting + preserving original indices + tolerance filtering) ----------------------
     l_traj_ts = left["traj"]["timestamp"].to_numpy()
     l_clamp_ts = left["clamp"]["timestamp"].to_numpy()
-    l_traj_arr = left["traj"][['Pos X','Pos Y','Pos Z','Q_X','Q_Y','Q_Z','Q_W']].to_numpy()
-    l_clamp_arr = left["clamp"]["clamp"].to_numpy()
+    
+    # 1. Sort timestamps and preserve original indices (to fix mapping misalignment issues)
+    sorted_l_traj_ts, sorted_l_traj_original_indices = sort_timestamps_with_original_indices(l_traj_ts)
+    sorted_l_clamp_ts, sorted_l_clamp_original_indices = sort_timestamps_with_original_indices(l_clamp_ts)
+    
+    # 2. Call the modified find_nearest_indices to get indices and alignment differences
+    l_traj_idx_sorted, l_traj_diffs = find_nearest_indices(sorted_l_traj_ts, master_ts)
+    l_clamp_idx_sorted, l_clamp_diffs = find_nearest_indices(sorted_l_clamp_ts, master_ts)
+    
+    # 3. Tolerance filtering: mark indices exceeding tolerance_s as -1 (invalid)
+    l_traj_invalid_mask = l_traj_diffs > tolerance_s
+    l_clamp_invalid_mask = l_clamp_diffs > tolerance_s
+    l_traj_idx_sorted[l_traj_invalid_mask] = -1
+    l_clamp_idx_sorted[l_clamp_invalid_mask] = -1
+    
+    # 4. Map back to original data indices (key: fix the issue where sorted indices do not correspond to original data)
+    l_traj_idx = np.full_like(l_traj_idx_sorted, -1)
+    valid_l_traj_mask = l_traj_idx_sorted != -1
+    l_traj_idx[valid_l_traj_mask] = sorted_l_traj_original_indices[l_traj_idx_sorted[valid_l_traj_mask]]
+    
+    l_clamp_idx = np.full_like(l_clamp_idx_sorted, -1)
+    valid_l_clamp_mask = l_clamp_idx_sorted != -1
+    l_clamp_idx[valid_l_clamp_mask] = sorted_l_clamp_original_indices[l_clamp_idx_sorted[valid_l_clamp_mask]]
+    
+    # 5. Log invalid alignment counts
+    l_traj_invalid_count = np.sum(l_traj_invalid_mask)
+    l_clamp_invalid_count = np.sum(l_clamp_invalid_mask)
+    if l_traj_invalid_count > 0:
+        print(f"[Warning] Left arm trajectory {l_traj_invalid_count} timestamps have alignment differences exceeding tolerance {tolerance_s}s and are marked as invalid")
+    if l_clamp_invalid_count > 0:
+        print(f"[Warning] Left arm clamp {l_clamp_invalid_count} timestamps have alignment differences exceeding tolerance {tolerance_s}s and are marked as invalid")
+    # ----------------------------------------------------------------------------------------------
 
-    # Right arrays
+    # ---------------------- Right arm data processing (same logic as left arm) ----------------------
     r_traj_ts = right["traj"]["timestamp"].to_numpy()
     r_clamp_ts = right["clamp"]["timestamp"].to_numpy()
+    r_cam_ts = right["timestamps"]["timestamp"].to_numpy()
+    r_cam_fidx = right["timestamps"]["frame_index"].to_numpy()
+    
+    # 1. Sort timestamps and preserve original indices
+    sorted_r_traj_ts, sorted_r_traj_original_indices = sort_timestamps_with_original_indices(r_traj_ts)
+    sorted_r_clamp_ts, sorted_r_clamp_original_indices = sort_timestamps_with_original_indices(r_clamp_ts)
+    sorted_r_cam_ts, sorted_r_cam_original_indices = sort_timestamps_with_original_indices(r_cam_ts)
+    
+    # 2. First align right arm camera timestamps with master timestamps
+    r_cam_idx_sorted, r_cam_diffs = find_nearest_indices(sorted_r_cam_ts, master_ts)
+    r_cam_invalid_mask = r_cam_diffs > tolerance_s
+    r_cam_idx_sorted[r_cam_invalid_mask] = -1
+    
+    # Map back to original camera indices
+    r_cam_idx = np.full_like(r_cam_idx_sorted, -1)
+    valid_r_cam_mask = r_cam_idx_sorted != -1
+    r_cam_idx[valid_r_cam_mask] = sorted_r_cam_original_indices[r_cam_idx_sorted[valid_r_cam_mask]]
+    
+    # 3. Based on aligned right arm camera timestamps, align trajectory and clamp data
+    r_cam_ts_aligned = np.full_like(master_ts, np.nan)
+    r_cam_ts_aligned[valid_r_cam_mask] = sorted_r_cam_ts[r_cam_idx_sorted[valid_r_cam_mask]]
+    
+    r_traj_idx_sorted, r_traj_diffs = find_nearest_indices(sorted_r_traj_ts, r_cam_ts_aligned)
+    r_clamp_idx_sorted, r_clamp_diffs = find_nearest_indices(sorted_r_clamp_ts, r_cam_ts_aligned)
+    
+    # 4. Tolerance filtering
+    r_traj_invalid_mask = r_traj_diffs > tolerance_s
+    r_clamp_invalid_mask = r_clamp_diffs > tolerance_s
+    r_traj_idx_sorted[r_traj_invalid_mask] = -1
+    r_clamp_idx_sorted[r_clamp_invalid_mask] = -1
+    
+    # 5. Map back to original data indices
+    r_traj_idx = np.full_like(r_traj_idx_sorted, -1)
+    valid_r_traj_mask = r_traj_idx_sorted != -1
+    r_traj_idx[valid_r_traj_mask] = sorted_r_traj_original_indices[r_traj_idx_sorted[valid_r_traj_mask]]
+    
+    r_clamp_idx = np.full_like(r_clamp_idx_sorted, -1)
+    valid_r_clamp_mask = r_clamp_idx_sorted != -1
+    r_clamp_idx[valid_r_clamp_mask] = sorted_r_clamp_original_indices[r_clamp_idx_sorted[valid_r_clamp_mask]]
+    
+    # 6. Log invalid alignment counts
+    r_cam_invalid_count = np.sum(r_cam_invalid_mask)
+    r_traj_invalid_count = np.sum(r_traj_invalid_mask)
+    r_clamp_invalid_count = np.sum(r_clamp_invalid_mask)
+    if r_cam_invalid_count > 0:
+        print(f"[Warning] Right arm camera {r_cam_invalid_count} timestamps have alignment differences exceeding tolerance {tolerance_s}s and are marked as invalid")
+    if r_traj_invalid_count > 0:
+        print(f"[Warning] Right arm trajectory {r_traj_invalid_count} timestamps have alignment differences exceeding tolerance {tolerance_s}s and are marked as invalid")
+    if r_clamp_invalid_count > 0:
+        print(f"[Warning] Right arm clamp {r_clamp_invalid_count} timestamps have alignment differences exceeding tolerance {tolerance_s}s and are marked as invalid")
+    # ----------------------------------------------------------------------------------------------
+
+    # Extract trajectory/clamp arrays
+    l_traj_arr = left["traj"][['Pos X','Pos Y','Pos Z','Q_X','Q_Y','Q_Z','Q_W']].to_numpy()
+    l_clamp_arr = left["clamp"]["clamp"].to_numpy()
     r_traj_arr = right["traj"][['Pos X','Pos Y','Pos Z','Q_X','Q_Y','Q_Z','Q_W']].to_numpy()
     r_clamp_arr = right["clamp"]["clamp"].to_numpy()
 
-    r_cam_ts = right["timestamps"]["timestamp"].to_numpy()
-    r_cam_fidx = right["timestamps"]["frame_index"].to_numpy()
-
-    # Precompute indices
-    l_traj_idx = find_nearest_indices(np.sort(l_traj_ts), master_ts)
-    l_clamp_idx = find_nearest_indices(np.sort(l_clamp_ts), master_ts)
-    r_cam_idx = find_nearest_indices(np.sort(r_cam_ts), master_ts)
-    r_cam_ts_aligned = r_cam_ts[r_cam_idx]
-    r_traj_idx = find_nearest_indices(np.sort(r_traj_ts), r_cam_ts_aligned)
-    r_clamp_idx = find_nearest_indices(np.sort(r_clamp_ts), r_cam_ts_aligned)
-
-    # Extract frames sequentially
-    left_indices = master_fidx.tolist()
-    right_indices = r_cam_fidx[r_cam_idx].tolist()
-    left_frames = extract_frames_sequential(left["video_path"], left_indices)
-    right_frames = extract_frames_sequential(right["video_path"], right_indices)
+    # Extract valid frame indices (skip invalid alignment indices)
+    valid_master_mask = (l_traj_idx != -1) & (l_clamp_idx != -1) & (r_cam_idx != -1) & (r_traj_idx != -1) & (r_clamp_idx != -1)
+    valid_master_fidx = master_fidx[valid_master_mask]
+    valid_r_cam_fidx = r_cam_fidx[r_cam_idx[valid_master_mask]]
+    
+    left_frames = extract_frames_sequential(left["video_path"], valid_master_fidx.tolist())
+    right_frames = extract_frames_sequential(right["video_path"], valid_r_cam_fidx.tolist())
 
     return (
         master_ts,
@@ -334,12 +487,14 @@ def prepare_bimanual_alignment(left: dict, right: dict, target_fps: int, source_
     )
 
 
-def prepare_single_alignment(single: dict, target_fps: int, source_camera_fps: int):
+def prepare_single_alignment(single: dict, target_fps: int, source_camera_fps: int, tolerance_s: float = 1e-4):
     """Prepare timestamp/trajectory indices and pre-extract frames for single-arm sessions.
 
     Args:
         single: dict returned by `load_arm_data` for the single arm.
         target_fps: desired output frequency in Hz.
+        source_camera_fps: original camera frequency in Hz.
+        tolerance_s: time alignment tolerance, timestamps exceeding this value are marked as invalid
 
     Returns:
         Tuple containing:
@@ -354,29 +509,62 @@ def prepare_single_alignment(single: dict, target_fps: int, source_camera_fps: i
     master_ts = master["timestamp"].to_numpy()
     master_fidx = master["frame_index"].to_numpy().astype(int)
 
+    # ---------------------- Single-arm data processing ----------------------
     traj_ts = single["traj"]["timestamp"].to_numpy()
     clamp_ts = single["clamp"]["timestamp"].to_numpy()
+    
+    # 1. Sort timestamps and retain original indices
+    sorted_traj_ts, sorted_traj_original_indices = sort_timestamps_with_original_indices(traj_ts)
+    sorted_clamp_ts, sorted_clamp_original_indices = sort_timestamps_with_original_indices(clamp_ts)
+    
+    # 2. Call the modified find_nearest_indices to get indices and alignment differences
+    traj_idx_sorted, traj_diffs = find_nearest_indices(sorted_traj_ts, master_ts)
+    clamp_idx_sorted, clamp_diffs = find_nearest_indices(sorted_clamp_ts, master_ts)
+    
+    # 3. Tolerance filtering: mark indices exceeding tolerance_s as -1
+    traj_invalid_mask = traj_diffs > tolerance_s
+    clamp_invalid_mask = clamp_diffs > tolerance_s
+    traj_idx_sorted[traj_invalid_mask] = -1
+    clamp_idx_sorted[clamp_invalid_mask] = -1
+    
+    # 4. Map back to original data indices
+    traj_idx = np.full_like(traj_idx_sorted, -1)
+    valid_traj_mask = traj_idx_sorted != -1
+    traj_idx[valid_traj_mask] = sorted_traj_original_indices[traj_idx_sorted[valid_traj_mask]]
+    
+    clamp_idx = np.full_like(clamp_idx_sorted, -1)
+    valid_clamp_mask = clamp_idx_sorted != -1
+    clamp_idx[valid_clamp_mask] = sorted_clamp_original_indices[clamp_idx_sorted[valid_clamp_mask]]
+    
+    # 5. Log warnings
+    traj_invalid_count = np.sum(traj_invalid_mask)
+    clamp_invalid_count = np.sum(clamp_invalid_mask)
+    if traj_invalid_count > 0:
+        print(f"[Warning] Single arm trajectory {traj_invalid_count} timestamps have alignment differences exceeding tolerance {tolerance_s}s and are marked as invalid")
+    if clamp_invalid_count > 0:
+        print(f"[Warning] Single arm clamp {clamp_invalid_count} timestamps have alignment differences exceeding tolerance {tolerance_s}s and are marked as invalid")
+    # ----------------------------------------------------------------------------------------------
+
+    # Extract trajectory/clamp arrays
     traj_arr = single["traj"][['Pos X','Pos Y','Pos Z','Q_X','Q_Y','Q_Z','Q_W']].to_numpy()
     clamp_arr = single["clamp"]["clamp"].to_numpy()
 
-    traj_idx = find_nearest_indices(np.sort(traj_ts), master_ts)
-    clamp_idx = find_nearest_indices(np.sort(clamp_ts), master_ts)
-
-    frame_indices = master_fidx.tolist()
-    frames = extract_frames_sequential(single["video_path"], frame_indices)
+    # Extract valid frame indices
+    valid_master_mask = (traj_idx != -1) & (clamp_idx != -1)
+    valid_master_fidx = master_fidx[valid_master_mask]
+    frames = extract_frames_sequential(single["video_path"], valid_master_fidx.tolist())
 
     return master_ts, master_fidx, traj_arr, clamp_arr, traj_idx, clamp_idx, frames
+
 
 @dataclasses.dataclass(frozen=True)
 class DatasetConfig:
     use_videos: bool = True
-    tolerance_s: float = 1e-4
+    tolerance_s: float = 1  # Time alignment tolerance, implemented in alignment logic
     image_writer_processes: int = 10
     image_writer_threads: int = 5
     video_backend: str | None = "pyav"
 
-
-# DEFAULT_DATASET_CONFIG = DatasetConfig()
 
 STATE_NAMES_8 = [
     "x",
@@ -453,8 +641,11 @@ def create_empty_dataset(
 
     dataset_dir = LEROBOT_HOME / repo_id
     if dataset_dir.exists():
-        shutil.rmtree(dataset_dir)
-
+        print(f"[Warning] Dataset directory {dataset_dir} already exists, it will be deleted and recreated")
+        try:
+            shutil.rmtree(dataset_dir)
+        except Exception as e:
+            raise RuntimeError(f"Failed to delete existing dataset directory {dataset_dir}: {str(e)}. Please check directory permissions.") from e
     return LeRobotDataset.create(
         repo_id=repo_id,
         fps=fps,
@@ -467,19 +658,166 @@ def create_empty_dataset(
         video_backend=dataset_config.video_backend,
     )
 
+# ---------------------------------------------------------------------------
+# added function: process a single session and return valid frame data
+# ---------------------------------------------------------------------------
+def process_single_session(
+    session_path: str,
+    bimanual: bool,
+    traj_source: str,
+    target_fps: int,
+    source_camera_fps: int,
+    tolerance_s: float,
+    task_name: str,
+    mode: str
+) -> Tuple[int, List[Dict[str, Any]]]:
+    """
+    Process a single session and return valid frame data.
+    Args:
+        All parameters are consistent with the original function to ensure complete parameter passing.
+    Returns:
+        (valid_frame_count, frame_data_list): Number of valid frames and the list of frame data to be written.
+    """
+    frame_data_list = []
+    valid = 0
+
+    print(f"[Info] Starting to process Session: {session_path}")
+    layout, paths = detect_layout(session_path)
+    if layout == "invalid":
+        print(f"[SKIP] Invalid session layout: {session_path}")
+        return valid, frame_data_list
+
+    if layout == "dual":
+        left = load_arm_data(paths["left"], traj_source)
+        right = load_arm_data(paths["right"], traj_source)
+        if left is None or right is None:
+            print(f"[SKIP] Bimanual session {session_path} missing left/right arm data, skipping")
+            return valid, frame_data_list
+
+        # Call alignment function
+        try:
+            (
+                master_ts,
+                master_fidx,
+                l_traj_arr,
+                l_clamp_arr,
+                r_traj_arr,
+                r_clamp_arr,
+                l_traj_idx,
+                l_clamp_idx,
+                r_traj_idx,
+                r_clamp_idx,
+                left_frames,
+                right_frames,
+                r_cam_fidx,
+                r_cam_idx,
+            ) = prepare_bimanual_alignment(left, right, target_fps, source_camera_fps, tolerance_s)
+        except Exception as e:
+            print(f"[SKIP] Bimanual session {session_path} alignment failed: {str(e)}, skipping")
+            return valid, frame_data_list
+
+        for i in range(len(master_ts)):
+            # Skip invalid indices
+            if (l_traj_idx[i] == -1) or (l_clamp_idx[i] == -1) or (r_traj_idx[i] == -1) or (r_clamp_idx[i] == -1) or (r_cam_idx[i] == -1):
+                continue
+            
+            l_fidx = master_fidx[i]
+            r_fidx = r_cam_fidx[r_cam_idx[i]]
+            if l_fidx not in left_frames or r_fidx not in right_frames:
+                continue
+            # Validate frame data
+            frame_l = _to_rgb_and_resize(left_frames[l_fidx])
+            frame_r = _to_rgb_and_resize(right_frames[r_fidx])
+            if frame_l is None or frame_r is None:
+                print(f"[Warning] Session {session_path} frame {l_fidx}/{r_fidx} invalid, skipping")
+                continue
+
+            l_idx_t = l_traj_idx[i]
+            l_idx_c = l_clamp_idx[i]
+            r_idx_t = r_traj_idx[i]
+            r_idx_c = r_clamp_idx[i]
+
+            l_pos = list(l_traj_arr[l_idx_t]) + [float(l_clamp_arr[l_idx_c])]
+            r_pos = list(r_traj_arr[r_idx_t]) + [float(r_clamp_arr[r_idx_c])]
+
+            state16 = np.asarray(l_pos + r_pos, dtype=np.float32)
+            action16 = state16.copy()
+
+            frame_data = {
+                "observation.state": state16,
+                "action": action16,
+                "observation.images.robot_0": frame_l,
+                "observation.images.robot_1": frame_r,
+                "robot_0_action": np.asarray(l_pos, dtype=np.float32),
+                "robot_1_action": np.asarray(r_pos, dtype=np.float32),
+            }
+
+            frame_data_list.append(frame_data)
+            valid += 1
+
+    else:  # single
+        single = load_arm_data(paths["single"], traj_source)
+        if single is None:
+            print(f"[SKIP] Single-arm session {session_path} missing data, skipping")
+            return valid, frame_data_list
+
+        # Call alignment function
+        try:
+            (
+                master_ts,
+                master_fidx,
+                traj_arr,
+                clamp_arr,
+                traj_idx,
+                clamp_idx,
+                frames,
+            ) = prepare_single_alignment(single, target_fps, source_camera_fps, tolerance_s)
+        except Exception as e:
+            print(f"[SKIP] Single-arm session {session_path} alignment failed: {str(e)}, skipping")
+            return valid, frame_data_list
+
+        for i in range(len(master_ts)):
+            # Skip invalid indices
+            if traj_idx[i] == -1 or clamp_idx[i] == -1:
+                continue
+            
+            fidx = master_fidx[i]
+            if fidx not in frames:
+                continue
+            # Validate frame data
+            img = _to_rgb_and_resize(frames[fidx])
+            if img is None:
+                print(f"[Warning] Session {session_path} frame {fidx} invalid, skipping")
+                continue
+            
+            pos_quat = list(traj_arr[traj_idx[i]]) + [float(clamp_arr[clamp_idx[i]])]
+
+            state8 = np.asarray(pos_quat, dtype=np.float32)
+            frame_data = {
+                "observation.state": state8,
+                "action": state8,
+                "observation.images.robot_0": img,
+            }
+
+            frame_data_list.append(frame_data)
+            valid += 1
+
+    print(f"[Info] Completed processing Session: {session_path}, new valid frames: {valid}")
+    return valid, frame_data_list
+
 
 def convert_raw_to_lerobot(
     task_root: Path,
     repo_id: str,
     task_name: str,
-    # camera_names: List[str],
     traj_source: str,
     target_fps: int,
     source_camera_fps: int,
     repo_output: Optional[Path],
     mode: str = "video",
+    max_workers: Optional[int] = None,  # New: parallel process count configuration
 ):
-    """Main conversion routine.
+    """Main conversion routine (with added parallel support).
 
     This will:
     - discover sessions using `find_all_sessions` from `raw2hdf5_new.py`;
@@ -489,164 +827,108 @@ def convert_raw_to_lerobot(
     """
     _ensure_module_path()
 
-    # Inline necessary helpers (copied from raw2hdf5_new.py) so this script
-    # is self-contained and does not import raw2hdf5_new at runtime.
-
-    # SOURCE_CAMERA_FPS = 60
     task_root = Path(task_root).expanduser().resolve()
     sessions = find_all_sessions(str(task_root))
     if not sessions:
         raise RuntimeError(f"No sessions found under {task_root}")
 
-    # Detect bimanual by checking first session layout
+    # Initialize DatasetConfig (get tolerance value)
+    dataset_config = DatasetConfig()
+    tolerance_s = dataset_config.tolerance_s  # Extract tolerance value for subsequent alignment
+
+    # Detect session layout (single-arm/dual-arm)
     first_layout, _ = detect_layout(sessions[0])
     bimanual = first_layout == "dual"
+    print(f"[Info] Detected session layout: {'Bimanual' if bimanual else 'Single-arm'}, processing accordingly")
 
-    # Create dataset
-    dataset = create_empty_dataset(repo_id=repo_id, fps=target_fps, mode=mode, bimanual=bimanual)
+    # Create empty dataset
+    dataset = create_empty_dataset(repo_id=repo_id, fps=target_fps, mode=mode, bimanual=bimanual, dataset_config=dataset_config)
 
     total_frames = 0
 
-    for idx, session_path in enumerate(sessions):
-        layout, paths = detect_layout(session_path)
-        if layout == "invalid":
-            print(f"[SKIP] Invalid session layout: {session_path}")
-            continue
+    # ---------------------------------------------------------------------------
+    # Refactor: Parallel processing of Sessions (core acceleration part)
+    # ---------------------------------------------------------------------------
+    # Configure parallel process count: default to CPU cores-1 (to avoid full load), user can specify manually
+    if max_workers is None:
+        max_workers = max(1, cpu_count()//5)
+    print(f"[Info] Starting parallel processing, number of processes: {max_workers}, number of Sessions to process: {len(sessions)}")
 
-        if layout == "dual":
-            left = load_arm_data(paths["left"], traj_source)
-            right = load_arm_data(paths["right"], traj_source)
-            if left is None or right is None:
-                print(f"[SKIP] missing data in dual session: {session_path}")
-                continue
+    # Construct parallel task parameters (each Session corresponds to a set of parameters)
+    task_params = [
+        (
+            session_path,
+            bimanual,
+            traj_source,
+            target_fps,
+            source_camera_fps,
+            tolerance_s,
+            task_name,
+            mode
+        )
+        for session_path in sessions
+    ]
 
-            (
-                master_ts,    # np.ndarray, master timeline timestamps (T,)
-                master_fidx,  # np.ndarray[int], master frame indices corresponding to master_ts
-                l_traj_arr,   # np.ndarray, left trajectory array (N_left, 7: pos + quat)
-                l_clamp_arr,  # np.ndarray, left clamp values (N_left,)
-                r_traj_arr,   # np.ndarray, right trajectory array (N_right, 7: pos + quat)
-                r_clamp_arr,  # np.ndarray, right clamp values (N_right,)
-                l_traj_idx,   # np.ndarray[int], indices mapping master_ts -> left traj rows
-                l_clamp_idx,  # np.ndarray[int], indices mapping master_ts -> left clamp rows
-                r_traj_idx,   # np.ndarray[int], indices mapping right-aligned cam ts -> right traj rows
-                r_clamp_idx,  # np.ndarray[int], indices mapping right-aligned cam ts -> right clamp rows
-                left_frames,  # dict[int->ndarray], extracted left camera frames keyed by frame index (BGR)
-                right_frames, # dict[int->ndarray], extracted right camera frames keyed by frame index (BGR)
-                r_cam_fidx,   # np.ndarray[int], frame indices for right camera timestamps
-                r_cam_idx,    # np.ndarray[int], indices mapping master_ts -> right camera timestamp indices
-            ) = prepare_bimanual_alignment(left, right, target_fps,source_camera_fps)
+    # 使用 ProcessPoolExecutor 并行执行
+    with concurrent.futures.ProcessPoolExecutor(max_workers=max_workers) as executor:
+        # Submit all tasks and get futures
+        future_to_session = {
+            executor.submit(process_single_session, *params): params[0]
+            for params in task_params
+        }
 
-            valid = 0
-            for i in range(len(master_ts)):
-                l_fidx = master_fidx[i]
-                r_fidx = r_cam_fidx[r_cam_idx[i]]
-                if l_fidx not in left_frames or r_fidx not in right_frames:
-                    continue
-                frame_l = _to_rgb_and_resize(left_frames[l_fidx])
-                frame_r = _to_rgb_and_resize(right_frames[r_fidx])
+        # Iterate over all completed tasks, aggregate results, and write to dataset
+        for future in concurrent.futures.as_completed(future_to_session):
+            session_path = future_to_session[future]
+            try:
+                valid_frames, frame_data_list = future.result()
+                # Main process writes to dataset uniformly (to avoid multi-process competition)
+                if valid_frames > 0:
+                    for frame_data in frame_data_list:
+                        dataset.add_frame(frame_data)
+                    dataset.save_episode(task=task_name, encode_videos=True)
+                    total_frames += valid_frames
+            except Exception as e:
+                print(f"[Error] Exception occurred while processing Session {session_path}: {str(e)}")
 
-                l_idx_t = l_traj_idx[i]
-                l_idx_c = l_clamp_idx[i]
-                r_idx_t = r_traj_idx[i]
-                r_idx_c = r_clamp_idx[i]
-
-                l_pos = list(l_traj_arr[l_idx_t]) + [float(l_clamp_arr[l_idx_c])]
-                r_pos = list(r_traj_arr[r_idx_t]) + [float(r_clamp_arr[r_idx_c])]
-
-                # Build per-frame dict compatible with create_empty_dataset
-                state16 = np.asarray(l_pos + r_pos, dtype=np.float32)
-                action16 = state16.copy()
-
-                frame = {
-                    "observation.state": state16,
-                    "action": action16,
-                    "observation.images.robot_0": frame_l,
-                    "observation.images.robot_1": frame_r,
-                    "robot_0_action": np.asarray(l_pos, dtype=np.float32),
-                    "robot_1_action": np.asarray(r_pos, dtype=np.float32),
-                }
-
-                dataset.add_frame(frame)
-                valid += 1
-
-            if valid > 0:
-                dataset.save_episode(task=task_name, encode_videos=True)
-                total_frames += valid
-
-        else:  # single
-            single = load_arm_data(paths["single"], traj_source)
-            if single is None:
-                print(f"[SKIP] missing data in single session: {session_path}")
-                continue
-
-            # `prepare_single_alignment` returns the following tuple:
-            # - master_ts: np.ndarray, master timeline timestamps sampled at `target_fps`
-            # - master_fidx: np.ndarray[int], frame indices on the camera corresponding to `master_ts`
-            # - traj_arr: np.ndarray (N,7), trajectory rows with [Pos X,Pos Y,Pos Z,Qx,Qy,Qz,Qw]
-            # - clamp_arr: np.ndarray (N,), gripper/clamp values aligned with trajectory timestamps
-            # - traj_idx: np.ndarray[int], indices mapping each `master_ts` entry -> row in `traj_arr`
-            # - clamp_idx: np.ndarray[int], indices mapping each `master_ts` entry -> row in `clamp_arr`
-            # - frames: dict[int->ndarray], pre-extracted BGR frames keyed by original frame index
-            (
-                master_ts,
-                master_fidx,
-                traj_arr,
-                clamp_arr,
-                traj_idx,
-                clamp_idx,
-                frames,
-            ) = prepare_single_alignment(single, target_fps, source_camera_fps)
-
-            valid = 0
-            for i in range(len(master_ts)):
-                fidx = master_fidx[i]
-                if fidx not in frames:
-                    continue
-                img = _to_rgb_and_resize(frames[fidx])
-                pos_quat = list(traj_arr[traj_idx[i]]) + [float(clamp_arr[clamp_idx[i]])]
-
-                state8 = np.asarray(pos_quat, dtype=np.float32)
-                frame = {
-                    "observation.state": state8,
-                    "action": state8,
-                    "observation.images.robot_0": img,
-                }
-                dataset.add_frame(frame)
-                valid += 1
-
-            if valid > 0:
-                dataset.save_episode(task=task_name, encode_videos=True)
-                total_frames += valid
-
-        print(f"Processed session {idx+1}/{len(sessions)}: {session_path} — frames added: {valid}")
-
+    # ---------------------------------------------------------------------------
     # Finalize dataset
+    # ---------------------------------------------------------------------------
+    print(f"\n[Info] All sessions processed, starting dataset finalization (computing statistics)")
     dataset.consolidate(run_compute_stats=True, keep_image_files=False)
 
-    
+    # Copy dataset to specified output path (if any)
     if repo_output is not None:
         target = Path(repo_output) / repo_id
         if target.exists():
-            shutil.rmtree(target)
- 
-        shutil.copytree(LEROBOT_HOME / repo_id, target, dirs_exist_ok=True)
-        print(f"Dataset copied to: {target}")
+            print(f"[Info] Target output directory {target} already exists, will delete and copy")
+            try:
+                shutil.rmtree(target)
+            except Exception as e:
+                raise RuntimeError(f"Failed to delete target output directory {target}: {str(e)}. Please check directory permissions.") from e
+        
+        try:
+            shutil.copytree(LEROBOT_HOME / repo_id, target, dirs_exist_ok=True)
+            print(f"[Info] Dataset copied to: {target}")
+        except Exception as e:
+            print(f"[Warning] Failed to copy dataset to {target}: {str(e)}. Dataset is still saved in the default path {LEROBOT_HOME / repo_id}")
 
-    print(f"Done. Total frames added: {total_frames}")
+    print(f"\nDone. Total frames added: {total_frames}")
 
 
 def _parse_args():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--task-root", type=Path, required=True)
-    parser.add_argument("--repo-id", type=str, required=True)
-    parser.add_argument("--task-name", type=str, default="Converted task")
-    # parser.add_argument("--camera-names", type=str, default="front")
-    parser.add_argument("--traj-source", type=str, default="merge")
-    parser.add_argument("--target-fps", type=int, default=20)
-    parser.add_argument("--source_camera_fps", type=int, default=60)
-    parser.add_argument("--mode", type=str, default="video", choices=["video", "image"])
-    parser.add_argument("--output", type=Path, default=None, help="optional copy destination for final dataset")
+    """Parse command-line arguments (restoring original functionality for easy direct command-line invocation)"""
+    parser = argparse.ArgumentParser(description="Convert raw recorded sessions to LeRobot dataset (with parallel acceleration).")
+    parser.add_argument("--task-root", type=Path, required=True, help="Path to root directory containing session folders.")
+    parser.add_argument("--repo-id", type=str, required=True, help="Repo ID for the LeRobot dataset (e.g., myorg/mytask).")
+    parser.add_argument("--task-name", type=str, default="Converted task", help="Name of the task (used in episode metadata).")
+    parser.add_argument("--traj-source", type=str, default="merge", choices=["merge", "slam", "vive"], help="Source of trajectory data.")
+    parser.add_argument("--target-fps", type=int, default=20, help="Desired output FPS for the dataset.")
+    parser.add_argument("--source_camera_fps", type=int, default=60, help="FPS of the original camera recordings.")
+    parser.add_argument("--mode", type=str, default="video", choices=["video", "image"], help="Dataset mode (video or image frames).")
+    parser.add_argument("--output", type=Path, default=None, help="Optional path to copy the final dataset (default: LEROBOT_HOME/repo-id).")
+    # Added: Number of parallel processes parameter
+    parser.add_argument("--max-workers", type=int, default=None, help="Number of parallel processes (default: CPU cores - 1).")
     return parser.parse_args()
 
 
@@ -662,17 +944,17 @@ if __name__ == "__main__":
         source_camera_fps=args.source_camera_fps,
         repo_output=args.output,
         mode=args.mode,
+        max_workers=args.max_workers,
     )
-
-    # Example usage:
+    # # 示例用法（直接运行，已开启并行）
     # convert_raw_to_lerobot(
-    #     task_root='/lumos-vePFS/suzhou/Users/jhf/data/raw/task_test/background_01/multi_sessions_20260104_131352',
-    #     repo_id= 'fastumi/task_test_20260128',
+    #     task_root='/lumos-vePFS/suzhou/Users/jhf/data/raw_step1/20251231O001/pass_packages',
+    #     repo_id= 'fastumi/20251231O001',
     #     task_name= 'Place the solid glue stick into the pen holder！',
-    #     camera_names=cam_names,
     #     traj_source= 'merge',
     #     target_fps=20,
     #     source_camera_fps = 60,
-    #     repo_output= '/lumos-vePFS/suzhou/Users/jhf/data/lerobot/test',
+    #     repo_output= '/lumos-vePFS/suzhou/Users/jhf/data/lerobot',
     #     mode= 'video',
+    #     max_workers=40,  # 可根据自身CPU核心数调整，例如8核CPU可设为6或7
     # )
