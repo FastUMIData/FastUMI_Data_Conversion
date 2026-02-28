@@ -11,15 +11,21 @@ Key assumptions:
 
 Minimal usage example (required flags shown):
 
-    python raw_2_lerobot_V4.0.py \
-        --task-root /path/to/raw/task_root \
-        --repo-id myorg/myrepo \
-        --task-name "Pick and place" \
-        --traj-source merge \
-        --target-fps 20 \
-        --source_camera_fps 20 \
-        --mode video \
-        --output /path/to/save/lerobot
+        python raw_2_lerobot_V4.0.py \
+                --task-root /path/to/raw/task_root \
+                --repo-id myorg/myrepo \
+                --task-name "Pick and place" \
+                --traj-source merge \
+                --target-fps 20 \
+                --source_camera_fps 60 \
+                --mode video \
+                --output /path/to/save/lerobot
+
+Notes:
+- `--output` is optional. If provided, the final dataset is copied to:
+    `<output>/<repo-id>`.
+- If `--output` is not provided, the dataset stays under the default
+    LeRobot cache directory: `HF_LEROBOT_HOME/<repo-id>`.
                        
 """
 from __future__ import annotations
@@ -36,6 +42,7 @@ import numpy as np
 import pandas as pd
 import subprocess
 import json
+from typing import Any
 
 # LeRobotDataset is provided by the `lerobot` package; we import it directly
 # from lerobot.common.datasets.lerobot_dataset import LeRobotDataset
@@ -219,8 +226,8 @@ def load_arm_data(data_path: str, traj_source: str):
     ensure_clamp_csv_for_path(data_path)
     if not (os.path.exists(video_path) and os.path.exists(timestamps_path) and os.path.exists(clamp_path)):
         return None
-    if not get_video_state(video_path):
-        return None
+    # if not get_video_state(video_path):
+    #     return None
     try:
         traj = load_trajectory(data_path, traj_source)
         clamp = pd.read_csv(clamp_path)
@@ -614,8 +621,17 @@ def convert_raw_to_lerobot(
 
         print(f"Processed session {idx+1}/{len(sessions)}: {session_path} — frames added: {valid}")
 
-    # Finalize dataset
+    # Finalize dataset: stop background workers and close parquet writer
     dataset.stop_image_writer()
+    # lerobot==0.4.0 keeps a parquet writer open; if not closed, the footer may be missing.
+    close_writer = getattr(dataset, "_close_writer", None)
+    if callable(close_writer):
+        close_writer()
+    # LeRobot metadata writer buffers `meta/episodes` and may flush only on destructor.
+    # Explicitly close it here so `meta/episodes` exists before copy.
+    meta_close_writer = getattr(getattr(dataset, "meta", None), "_close_writer", None)
+    if callable(meta_close_writer):
+        meta_close_writer()
 
     # dataset.consolidate(run_compute_stats=True, keep_image_files=False)
 
@@ -647,6 +663,7 @@ def _parse_args():
 
 if __name__ == "__main__":
     args = _parse_args()
+    print(f"Starting conversion with args: {args}")
     convert_raw_to_lerobot(
         task_root=args.task_root,
         repo_id=args.repo_id,
@@ -661,13 +678,13 @@ if __name__ == "__main__":
 
     # # Example usage:
     # convert_raw_to_lerobot(
-    #     task_root=r'C:\project\data_process\task_test\background_01\multi_sessions_20251231_174451',
+    #     task_root=r'C:\project\data\test\multi_sessions_20260108_132839',
     #     repo_id='fastumi/task_test_20260128',
     #     task_name= 'Place the solid glue stick into the pen holder！',
     #     # camera_names=cam_names,
     #     traj_source= 'merge',
     #     target_fps=20,
     #     source_camera_fps = 60,
-    #     repo_output= r'C:\project\data_process\task_test2',
+    #     repo_output= r'C:\project\data\test\lerobot',
     #     mode= 'video',
     # )
